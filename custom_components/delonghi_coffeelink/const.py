@@ -27,9 +27,12 @@ COMMAND_PROPERTY_CANDIDATES = ["data_request", "app_data_request"]
 RESPONSE_PROPERTY_CANDIDATES = ["data_response", "app_data_response"]
 CONNECTED_PROPERTY_CANDIDATES = ["device_connected", "app_device_connected"]
 
-# Stable HA client id for app_device_connected (DlghIoT uses 0xC0FFEE11).
-# Used ONLY for session registration and property app_id checks.
-# NOT the 4-byte device signature appended to learned command frames.
+# FALLBACK cloud-session id for app_device_connected (DlghIoT uses 0xC0FFEE11).
+# ECAM machines only execute commands from a session registered with THEIR OWN
+# 4-byte device signature, so the coordinator derives the real id from a learned
+# app frame (see command_builder.app_id_from_signature / issue #15). This
+# constant is only what we register with before any frame has been learned - a
+# session opened with it is accepted by Ayla and then ignored by the machine.
 INTEGRATION_CLOUD_APP_ID = 0xC0FFEE11
 
 APP_ID_PROPERTY = "app_id"  # machine property: current session holder
@@ -77,10 +80,23 @@ POWER_STANDBY_PARAMS = bytes([0x01, 0x01])
 # Session refresh / deep-standby nudge (DlghIoT refresh(), params 03 02, CRC 5640).
 POWER_SESSION_REFRESH_PARAMS = bytes([0x03, 0x02])
 
-# Machine monitor (d302_monitor_machine) - operational state published by the
-# machine. Status codes from the DlghIoT client (framagit.org/mattgk/dlghiot),
-# contributed via PR #5.
-MONITOR_PROPERTY = "d302_monitor_machine"
+# Machine monitor - operational state published by the machine. Status codes
+# from the DlghIoT client (framagit.org/mattgk/dlghiot), contributed via PR #5.
+#
+# The datapoint name varies by model, like every other channel here: the Eletta
+# Explore publishes d302_monitor_machine while several Soul builds (ECAM610.55,
+# ECAM612.55) publish d302_monitor (issue #14). Listed in priority order, but
+# the coordinator only trusts a candidate whose blob actually DECODES: being
+# listed proves nothing (the reference Soul exposes a d303_monitor_extended it
+# never writes to) and carrying bytes proves nothing either (they could be a
+# stale or truncated packet).
+MONITOR_PROPERTY_CANDIDATES = ["d302_monitor_machine", "d302_monitor"]
+
+# How long the cloud's connection_status is trusted enough to REFUSE a command.
+# The status only refreshes on a successful poll, so a cloud outage or a broken
+# poll loop freezes it: past this age the preflight fails open rather than
+# blaming the machine for what may well be the cloud's fault.
+REACHABILITY_MAX_AGE = 3 * DEFAULT_SCAN_INTERVAL  # seconds
 MACHINE_STATUS = {
     0: "standby",
     1: "waking_up",
@@ -97,6 +113,14 @@ MACHINE_STATUS = {
     17: "preparing_milk_alt",
     29: "unknown",
 }
+MACHINE_STATUS_OPTIONS = tuple(dict.fromkeys(MACHINE_STATUS.values()))
+CONNECTION_STATUS_OPTIONS = ("online", "offline", "unknown")
+
+
+def normalize_connection_status(value: object) -> str:
+    """Return a stable Home Assistant enum key for an Ayla connection value."""
+    normalized = str(value).strip().lower() if value is not None else ""
+    return normalized if normalized in CONNECTION_STATUS_OPTIONS else "unknown"
 
 # Default recipe params (from captured hot water command)
 # Bytes: temp_flag, reserved, quantity_low, quantity_high?, recipe_type, ???
@@ -171,11 +195,32 @@ COUNTER_SENSORS = [
     (["d556_water_hardness"],              "water_hardness",        "Water Hardness",        "mdi:water-percent"),
 ]
 
+# Counters that carry a physical quantity instead of a plain count.
+#
+# Keyed by the ENTITY key of COUNTER_SENSORS above, not by datapoint name: a
+# measurement is the same measurement whichever datapoint a given model happens
+# to publish it under, so a new machine is supported by adding its datapoint to
+# the candidate list of the matching row - never by touching sensor.py. Values
+# are opaque tokens (this module stays free of Home Assistant imports so the
+# protocol tests can import it standalone); sensor.py maps them to device
+# classes and units.
+MEASUREMENT_WATER_LITERS = "water_liters"
+
+# De'Longhi machines report water volumes in millilitres, while Home Assistant's
+# water device class works in litres. Sources: DeLonghi's own statistics sheet
+# is in litres, sk7n4k3d/delonghi-ha applies scale=0.001 to the same datapoints,
+# and PyDeLonghiAPI derives lifetime litres as d553 / 1000 (see issue #19).
+COUNTER_MEASUREMENTS: dict[str, str] = {
+    "water_total_quantity": MEASUREMENT_WATER_LITERS,
+    "water_filter_quantity": MEASUREMENT_WATER_LITERS,
+}
+
 # Info sensors (not counters, general state):
 #   (candidate_property_names, entity_key, display_name, icon)
+# "Last Connected" is NOT here: it does not come from a datapoint at all but
+# from the cloud device record (see sensor.DelonghiLastConnectedSensor).
 INFO_SENSORS = [
-    (["software_version"],                         "software_version", "Software Version", "mdi:chip"),
-    (["device_connected", "app_device_connected"], "last_connected",   "Last Connected",   "mdi:clock-outline"),
+    (["software_version"], "software_version", "Software Version", "mdi:chip"),
 ]
 
 PLATFORMS = ["sensor", "binary_sensor", "button"]

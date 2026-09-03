@@ -28,6 +28,7 @@ def _load(modname: str, filename: str):
 
 counters = _load("counters", "counters.py")
 parse_counter_value = counters.parse_counter_value
+parse_water_volume_liters = counters.parse_water_volume_liters
 counter_breakdown = counters.counter_breakdown
 
 
@@ -68,6 +69,23 @@ def test_parse_counter_value_bool_is_not_int():
     assert parse_counter_value(False) is None
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (387213, 387.213),
+        ("387213", 387.213),
+        (0, 0.0),
+        (1, 0.001),
+        (None, None),
+        (True, None),
+        ("not-a-number", None),
+        ('{"part_a": 1000, "part_b": 250}', 1.25),
+    ],
+)
+def test_parse_water_volume_liters(value, expected):
+    assert parse_water_volume_liters(value) == expected
+
+
 # --- counter_breakdown ---------------------------------------------------- #
 
 def test_counter_breakdown_returns_json_object():
@@ -83,3 +101,23 @@ def test_counter_breakdown_returns_json_object():
 )
 def test_counter_breakdown_none_for_non_objects(value):
     assert counter_breakdown(value) is None
+
+
+# --- declarative measurement table ---------------------------------------- #
+
+def test_measured_counters_reference_real_counter_keys():
+    """A typo in COUNTER_MEASUREMENTS would silently drop the conversion."""
+    const = _load("const", "const.py")
+
+    keys = {key for _candidates, key, _friendly, _icon in const.COUNTER_SENSORS}
+    assert set(const.COUNTER_MEASUREMENTS) <= keys
+
+
+def test_water_counters_are_declared_as_litres():
+    """The mL -> L conversion is data, not a branch inside the entity."""
+    const = _load("const", "const.py")
+
+    assert const.COUNTER_MEASUREMENTS == {
+        "water_total_quantity": const.MEASUREMENT_WATER_LITERS,
+        "water_filter_quantity": const.MEASUREMENT_WATER_LITERS,
+    }

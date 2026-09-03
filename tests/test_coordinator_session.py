@@ -1,0 +1,818 @@
+"""Coordinator wiring: cloud-session identity (#15), reachability, monitor (#14).
+
+The pure helpers are covered in ``test_eletta_session`` and ``test_monitor``;
+what matters here is that the coordinator actually *uses* them - the original
+bug was precisely a correct-looking session that carried the wrong identity.
+Home Assistant is not installed in this suite, so the handful of symbols the
+coordinator imports from it are stubbed with the minimum surface these tests
+exercise. This is the only module that loads ``coordinator.py``, which is why
+new coordinator cases belong here: a second module installing its own stubs
+would race this one for the cached ``sys.modules`` entries.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import importlib.util
+import sys
+import time
+import types
+from pathlib import Path
+
+import pytest
+
+if importlib.util.find_spec("homeassistant") is not None:  # pragma: no cover
+    # A real Home Assistant is installed (CI with pytest-homeassistant-custom-
+    # component): the stubs below would shadow it for every later import, so this
+    # module steps aside - port these cases to the HA fixtures instead.
+    pytest.skip(
+        "real Home Assistant present; stub-based coordinator tests skipped",
+        allow_module_level=True,
+    )
+
+PKG_DIR = Path(__file__).resolve().parents[1] / "custom_components" / "delonghi_coffeelink"
+
+
+# --- minimal Home Assistant stubs ------------------------------------------
+
+class _StubStore:
+    """helpers.storage.Store: in-memory, records delayed saves."""
+
+    def __init__(self, hass=None, version=None, key=None) -> None:
+        self.data: dict | None = None
+        self.saves = 0
+
+    async def async_load(self) -> dict | None:
+        return self.data
+
+    def async_delay_save(self, data_func, delay: float = 0) -> None:
+        self.saves += 1
+        self.data = data_func()
+
+
+class _StubCoordinator:
+    """helpers.update_coordinator.DataUpdateCoordinator."""
+
+    def __init__(self, hass, logger, name=None, update_interval=None) -> None:
+        self.hass = hass
+        self.logger = logger
+        self.name = name
+        self.update_interval = update_interval
+        self.data: dict | None = None
+
+    def __class_getitem__(cls, item):  # DataUpdateCoordinator[dict[str, Any]]
+        return cls
+
+    async def async_shutdown(self) -> None:
+        return None
+
+    async def async_request_refresh(self) -> None:
+        return None
+
+
+class _StubHomeAssistantError(Exception):
+    """exceptions.HomeAssistantError, with the translation kwargs HA accepts."""
+
+    def __init__(self, *args, translation_domain=None, translation_key=None,
+                 translation_placeholders=None) -> None:
+        super().__init__(*args)
+        self.translation_domain = translation_domain
+        self.translation_key = translation_key
+        self.translation_placeholders = translation_placeholders
+
+
+def _install_stubs() -> None:
+    core = types.ModuleType("homeassistant.core")
+    core.HomeAssistant = object
+    exceptions = types.ModuleType("homeassistant.exceptions")
+    exceptions.HomeAssistantError = _StubHomeAssistantError
+    storage = types.ModuleType("homeassistant.helpers.storage")
+    storage.Store = _StubStore
+    upd = types.ModuleType("homeassistant.helpers.update_coordinator")
+    upd.DataUpdateCoordinator = _StubCoordinator
+    upd.UpdateFailed = type("UpdateFailed", (Exception,), {})
+    for name, mod in (
+        ("homeassistant", types.ModuleType("homeassistant")),
+        ("homeassistant.core", core),
+        ("homeassistant.exceptions", exceptions),
+        ("homeassistant.helpers", types.ModuleType("homeassistant.helpers")),
+        ("homeassistant.helpers.storage", storage),
+        ("homeassistant.helpers.update_coordinator", upd),
+    ):
+        sys.modules[name] = mod
+
+
+def _load(modname: str, filename: str):
+    full = f"delonghi_coffeelink.{modname}"
+    if full in sys.modules:
+        return sys.modules[full]
+    spec = importlib.util.spec_from_file_location(full, PKG_DIR / filename)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[full] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+if "delonghi_coffeelink" not in sys.modules:
+    _pkg = types.ModuleType("delonghi_coffeelink")
+    _pkg.__path__ = [str(PKG_DIR)]
+    sys.modules["delonghi_coffeelink"] = _pkg
+
+_install_stubs()
+const = _load("const", "const.py")
+cb = _load("command_builder", "command_builder.py")
+ac = _load("ayla_client", "ayla_client.py")
+coordinator = _load("coordinator", "coordinator.py")
+
+COFFEE_FRAME = "DQ+D8AIDAQBuAgMnAQa/qWp4qtoAxYYh"
+COFFEE_SIGNATURE = bytes.fromhex("00c58621")
+COFFEE_APP_ID = 12944929
+DEFAULT_APP_ID = ac.normalize_signed_app_id(const.INTEGRATION_CLOUD_APP_ID)
+SOUL_HOT_WATER = "DQ2D8BABDwD6GwEGgSRqILPb"
+
+
+class _RecordingClient:
+    """The slice of DelonghiAylaClient the send paths touch."""
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, str, str]] = []
+
+    async def async_set_property_value(self, dsn: str, prop: str, value: str) -> dict:
+        self.writes.append((dsn, prop, value))
+        return {}
+
+
+class _PollingClient(_RecordingClient):
+    """Also answers a full poll, so _async_update_data can really run."""
+
+    def __init__(self, connection_status: str = "Online", props: dict | None = None) -> None:
+        super().__init__()
+        self.connection_status = connection_status
+        self.connected_at = "2026-08-12T04:01:46Z"
+        self.props = props if props is not None else {}
+
+    async def async_get_properties(self, dsn: str) -> dict:
+        return self.props
+
+    async def async_get_devices(self) -> list:
+        return [
+            ac.AylaDevice(
+                dsn="AC000W046513715",
+                name="Coffee Maker",
+                oem_model="DL-millcore",
+                model="ECAM450.65.S",
+                sw_version="1.0",
+                lan_ip="192.168.1.10",
+                connection_status=self.connection_status,
+                connected_at=self.connected_at,
+            )
+        ]
+
+
+def _coord(oem_model: str, connection_status: str = "Online", client=None):
+    device = ac.AylaDevice(
+        dsn="AC000W046513715",
+        name="Coffee Maker",
+        oem_model=oem_model,
+        model="ECAM450.65.S",
+        sw_version="1.0",
+        lan_ip="192.168.1.10",
+        connection_status=connection_status,
+        connected_at="2026-08-12T04:01:46Z",
+    )
+    coord = coordinator.DelonghiCoordinator(object(), client, device)
+    coord.command_property = "data_request"
+    return coord
+
+
+def _decoded(frame: str) -> dict:
+    decoded = cb.decode_command(frame)
+    decoded["origin"] = "app"
+    return decoded
+
+
+# --- Eletta -----------------------------------------------------------------
+
+def test_eletta_starts_on_the_fallback_constant():
+    coord = _coord("DL-striker-cb")
+    assert coord.own_cloud_app_id == DEFAULT_APP_ID
+    assert coord.uses_device_cloud_app_id is False
+
+
+def test_learning_a_frame_switches_the_session_to_the_machine_id():
+    coord = _coord("DL-striker-cb")
+    coord._maybe_learn_frame(_decoded(COFFEE_FRAME))
+    assert coord.learned_start_frames == {0x02: COFFEE_FRAME}
+    assert coord.own_cloud_app_id == COFFEE_APP_ID
+    assert coord.uses_device_cloud_app_id is True
+    # the id actually used for the session POST follows
+    assert coord._integration_app_id == COFFEE_APP_ID
+    # and a session confirmed under the old id must be re-established
+    assert coord._session_confirmed is False
+    assert coord._last_connect_at == 0
+
+
+def test_restart_restores_the_machine_id_before_any_new_capture():
+    coord = _coord("DL-striker-cb")
+    coord._store.data = cb.serialize_learned_frames({0x02: COFFEE_FRAME}, {}, None)
+    asyncio.run(coord.async_load_learned())
+    assert coord.learned_start_frames == {0x02: COFFEE_FRAME}
+    assert coord.own_cloud_app_id == COFFEE_APP_ID
+    assert coord._integration_app_id == COFFEE_APP_ID
+
+
+def test_adopted_foreign_session_is_not_rebound_by_a_new_capture():
+    """A foreign session must keep riding the app's id until it is released."""
+    coord = _coord("DL-striker-cb")
+    coord._integration_app_id = 777
+    coord._maybe_learn_frame(_decoded(COFFEE_FRAME))
+    assert coord.own_cloud_app_id == COFFEE_APP_ID
+    assert coord._integration_app_id == 777
+    # once the machine reports a free slot, we revert to the derived id
+    coord._update_session_from_props({const.APP_ID_PROPERTY: {"value": 0}})
+    assert coord._integration_app_id == COFFEE_APP_ID
+
+
+def test_session_holder_is_ours_once_the_machine_id_is_known():
+    coord = _coord("DL-striker-cb")
+    coord._maybe_learn_frame(_decoded(COFFEE_FRAME))
+    coord._update_session_from_props(
+        {const.APP_ID_PROPERTY: {"value": str(COFFEE_APP_ID)}}
+    )
+    assert coord._session_confirmed is True
+
+
+def test_wake_and_standby_carry_the_machine_signature():
+    coord = _coord("DL-striker-cb")
+    coord._maybe_learn_frame(_decoded(COFFEE_FRAME))
+    for value in (coord._wake_command_value(), coord._standby_command_value()):
+        assert base64.b64decode(value)[-4:] == COFFEE_SIGNATURE
+
+
+def test_unlearnable_frame_leaves_the_session_id_alone():
+    coord = _coord("DL-striker-cb")
+    raw = bytearray(base64.b64decode(COFFEE_FRAME))
+    raw[8] ^= 0xFF  # corrupt the bytes the CRC covers
+    coord._maybe_learn_frame(_decoded(base64.b64encode(bytes(raw)).decode()))
+    assert coord.learned_start_frames == {}
+    assert coord.own_cloud_app_id == DEFAULT_APP_ID
+
+
+def _capture(coord, frame: str, prop: str = "app_data_request") -> None:
+    """Drive a frame through the sniffer the way a poll would."""
+    coord.command_property = prop
+    coord._capture_channel(
+        {prop: {"value": "AA==", "data_updated_at": "t0"}}, prop, channel="command"
+    )
+    coord._capture_channel(
+        {prop: {"value": frame, "data_updated_at": "t1"}}, prop, channel="command"
+    )
+
+
+def test_sniffer_learns_the_coffee_frame_end_to_end():
+    """Issue #15 bug 2, through the real capture path: Coffee used to be dropped."""
+    coord = _coord("DL-striker-cb")
+    _capture(coord, COFFEE_FRAME)
+    assert coord.learned_start_frames == {0x02: COFFEE_FRAME}
+    assert coord.own_cloud_app_id == COFFEE_APP_ID
+
+
+def test_replayed_learned_frame_keeps_crc_and_signature():
+    coord = _coord("DL-striker-cb")
+    _capture(coord, COFFEE_FRAME)
+    replayed = coord.profile.beverage_value(
+        0x02, const.ACTION_START, coord.learned_start_frames[0x02]
+    )
+    decoded = cb.decode_command(replayed)
+    assert decoded["crc_valid"] is True
+    assert decoded["recipe"] == "01 00 6e 02 03 27 01 06"
+    assert base64.b64decode(replayed)[-4:] == COFFEE_SIGNATURE
+    assert replayed != COFFEE_FRAME  # only the timestamp moved
+
+
+def test_sniffer_ignores_our_own_echoed_command():
+    coord = _coord("DL-striker-cb")
+    coord._record_sent(COFFEE_FRAME)
+    _capture(coord, COFFEE_FRAME)
+    assert coord.learned_start_frames == {}
+
+
+def test_sniffer_does_not_learn_our_own_fallback_frame():
+    """A Soul-shaped fallback seen on the wire is ours, not something to learn."""
+    coord = _coord("DL-striker-cb")
+    _capture(coord, SOUL_HOT_WATER)
+    assert coord.last_captured_command["matches_integration"] is True
+    assert coord.learned_start_frames == {}
+    assert coord.own_cloud_app_id == DEFAULT_APP_ID
+
+
+# --- Soul (reference machine) ----------------------------------------------
+
+def test_soul_never_learns_and_keeps_the_default_id():
+    coord = _coord("DL-millcore")
+    coord._maybe_learn_frame(_decoded(COFFEE_FRAME))
+    coord._maybe_learn_frame(_decoded(SOUL_HOT_WATER))
+    assert coord.learned_start_frames == {}
+    assert coord.learned_stop_frames == {}
+    assert coord.own_cloud_app_id == DEFAULT_APP_ID
+    assert coord.uses_device_cloud_app_id is False
+
+
+def test_soul_command_bytes_are_unchanged():
+    """The Soul path synthesizes its frame and never touches the session id."""
+    coord = _coord("DL-millcore")
+    assert coord.profile.uses_cloud_session is False
+    built = coord.profile.beverage_value(0x10, const.ACTION_START, None)
+    assert base64.b64decode(built)[:12].hex(" ") == "0d 0d 83 f0 10 01 0f 00 fa 1b 01 06"
+
+
+# --- reachability preflight -------------------------------------------------
+#
+# An offline machine still gets HTTP 200/201 from Ayla for every datapoint
+# write, so nothing anywhere reports a failure: the reference Soul sat off the
+# network for ten days while Home Assistant kept "sending" wakes. These cases
+# pin the guard AND its narrowness - only an explicit Offline may block.
+
+SEND_CALLS = (
+    ("wake", lambda coord: coord.async_send_wake()),
+    ("standby", lambda coord: coord.async_send_standby()),
+    ("beverage start", lambda coord: coord.async_send_beverage(0x01, const.ACTION_START)),
+    ("beverage stop", lambda coord: coord.async_send_beverage(0x10, const.ACTION_STOP)),
+)
+# Both families: the Soul synthesizes its frames, the Eletta replays learned ones
+# behind a cloud session. Neither may reach the cloud while the machine is gone.
+GUARDED_MODELS = ("DL-millcore", "DL-striker-cb")
+
+
+@pytest.mark.parametrize("model", GUARDED_MODELS)
+@pytest.mark.parametrize("label,call", SEND_CALLS, ids=[case[0] for case in SEND_CALLS])
+def test_offline_machine_refuses_to_send(label, call, model):
+    client = _RecordingClient()
+    coord = _coord(model, connection_status="Offline", client=client)
+
+    with pytest.raises(_StubHomeAssistantError) as err:
+        asyncio.run(call(coord))
+
+    assert err.value.translation_key == "machine_offline"
+    assert err.value.translation_domain == const.DOMAIN
+    assert err.value.translation_placeholders == {"name": "Coffee Maker"}
+    assert client.writes == [], f"{label} on {model} reached the cloud despite Offline"
+
+
+def test_the_raw_channel_is_never_refused():
+    """`send_raw_command` is the field-instrumentation escape hatch.
+
+    Refusing it would remove the only way to poke a machine when what is wrong
+    is the integration's own idea of its state - the instrumentation this repo
+    diagnoses with must survive its own guards.
+    """
+    client = _RecordingClient()
+    coord = _coord("DL-millcore", connection_status="Offline", client=client)
+
+    asyncio.run(coord.async_send_raw("DQeEDwIBVRJqiYFO"))
+
+    assert [value for _dsn, _prop, value in client.writes] == ["DQeEDwIBVRJqiYFO"]
+
+
+def test_online_machine_still_sends():
+    client = _RecordingClient()
+    coord = _coord("DL-millcore", connection_status="Online", client=client)
+
+    asyncio.run(coord.async_send_wake())
+
+    assert len(client.writes) == 1
+    dsn, prop, value = client.writes[0]
+    assert (dsn, prop) == (coord.device.dsn, "data_request")
+    assert base64.b64decode(value)[:6].hex(" ") == "0d 07 84 0f 02 01"
+
+
+def test_deep_standby_machine_is_never_blocked():
+    """A machine in standby is Online, and must stay wakeable (#1).
+
+    Issue #1 is an Eletta (DL-striker-cb), the profile where standby actually
+    changes the send sequence: the guard reads connection_status, never the
+    monitor, so a standby machine is not blocked - it gets the deep-standby
+    nudge and then the wake.
+    """
+    client = _RecordingClient()
+    coord = _coord("DL-striker-cb", connection_status="Online", client=client)
+    coord.monitor = {"status": 0, "status_name": "standby"}
+
+    asyncio.run(coord.async_send_wake())
+
+    assert coord.machine_is_offline is False
+    families = [
+        base64.b64decode(value)[2:4].hex(" ") for _dsn, _prop, value in client.writes
+    ]
+    assert families == ["84 0f", "84 0f"]  # session refresh, then wake
+    params = [
+        base64.b64decode(value)[4:6].hex(" ") for _dsn, _prop, value in client.writes
+    ]
+    assert params == ["03 02", "02 01"]
+
+
+def test_an_awake_machine_gets_no_standby_nudge():
+    """Pins the other side of the monitor gate: no nudge unless status is 0.
+
+    Resolving the monitor datapoint (issue #14) revives this branch on machines
+    where self.monitor used to stay empty forever, so both sides need a test.
+    """
+    client = _RecordingClient()
+    coord = _coord("DL-striker-cb", connection_status="Online", client=client)
+    coord.monitor = {"status": 7, "status_name": "ready"}
+
+    asyncio.run(coord.async_send_wake())
+
+    assert len(client.writes) == 1
+    assert base64.b64decode(client.writes[0][2])[4:6].hex(" ") == "02 01"
+
+
+def test_a_stale_offline_status_fails_open():
+    """A frozen status must not keep blaming the machine.
+
+    connection_status only moves on a successful poll. If the cloud (or the poll
+    loop) breaks while it last said Offline, refusing forever would turn a cloud
+    outage into a permanently dead integration - so past REACHABILITY_MAX_AGE
+    the preflight steps aside.
+    """
+    client = _RecordingClient()
+    coord = _coord("DL-millcore", connection_status="Offline", client=client)
+    coord._device_seen_at = time.time() - const.REACHABILITY_MAX_AGE - 1
+
+    assert coord.reachability_is_current is False
+    asyncio.run(coord.async_send_wake())
+    assert len(client.writes) == 1
+
+
+def test_a_fresh_offline_status_still_blocks():
+    coord = _coord("DL-millcore", connection_status="Offline", client=_RecordingClient())
+
+    assert coord.reachability_is_current is True
+    with pytest.raises(_StubHomeAssistantError):
+        asyncio.run(coord.async_send_wake())
+
+
+@pytest.mark.parametrize("status", ["Unknown", "", "Weird New Value", None])
+def test_only_an_explicit_offline_blocks(status):
+    client = _RecordingClient()
+    coord = _coord("DL-millcore", connection_status=status, client=client)
+
+    assert coord.machine_is_offline is False
+    asyncio.run(coord.async_send_wake())
+    assert len(client.writes) == 1
+
+
+def test_offline_detection_is_case_insensitive():
+    assert _coord("DL-millcore", connection_status="offline").machine_is_offline
+    assert _coord("DL-millcore", connection_status="OFFLINE").machine_is_offline
+
+
+def test_a_poll_refreshes_the_status_the_guard_reads():
+    """End-to-end: the machine comes back and the next poll unblocks commands.
+
+    The whole guard rests on _async_update_data re-listing the device, so that
+    is what this drives - not a hand-assigned coord.device, which would pass
+    even if the poll never refreshed anything.
+    """
+    client = _PollingClient(connection_status="Offline")
+    coord = _coord("DL-millcore", connection_status="Offline", client=client)
+    with pytest.raises(_StubHomeAssistantError):
+        asyncio.run(coord.async_send_wake())
+
+    client.connection_status = "Online"
+    client.connected_at = "2026-08-22T09:15:00Z"
+    asyncio.run(coord._async_update_data())
+
+    assert coord.device.connection_status == "Online"
+    assert coord.device.connected_at == "2026-08-22T09:15:00Z"
+    asyncio.run(coord.async_send_wake())
+    assert len(client.writes) == 1
+
+
+def test_a_poll_that_never_succeeds_leaves_the_status_stale():
+    """The mirror case: no refresh means the guard must eventually fail open."""
+    coord = _coord("DL-millcore", connection_status="Offline", client=_RecordingClient())
+    coord._device_seen_at = time.time() - const.REACHABILITY_MAX_AGE - 1
+
+    assert coord.machine_is_offline is True
+    assert coord.reachability_is_current is False
+
+
+# --- monitor datapoint resolution (issue #14) -------------------------------
+#
+# SOUL_MONITOR_BLOB is a real d302_monitor value read from the reference
+# PrimaDonna Soul (ECAM 612.55.SB, dsn AC000W019023280) on 2026-08-22: this
+# machine publishes d302_monitor, while MONITOR_PROPERTY used to be hard-wired
+# to d302_monitor_machine - which is why Machine Status stayed unknown forever
+# on that family. The blob itself decodes fine with the existing parser.
+
+SOUL_MONITOR_BLOB = "0BJ1DwRAAgUAAAJkAAAAAACSz2p8UbM="
+
+
+def _monitor_props(**candidates):
+    return {name: {"value": value} for name, value in candidates.items()}
+
+
+def _build_monitor_blob(contents: bytes) -> str:
+    """A valid MonitorV2 packet around a contents block (same envelope as the real ones).
+
+    Mirrors the builder in test_monitor.py: <0x0d> <length> <data> <crc16> <ts>,
+    data = [0x75, subid, *contents], CRC over raw[0:length-1].
+    """
+    data = bytes([0x75, 0x00]) + contents
+    body = bytes([0x0D, len(data) + 3]) + data
+    raw = body + cb.crc16_aug_ccitt(body).to_bytes(2, "big") + b"\x00\x00\x00\x00"
+    return base64.b64encode(raw).decode()
+
+
+# Synthetic, not a field capture: no real Eletta d302_monitor_machine value has
+# been contributed. Built through the same envelope the machine uses so it
+# exercises the real decode path - ready, 42% through, switches 0x0201.
+ELETTA_MONITOR_BLOB = _build_monitor_blob(
+    bytes([0x01, 0x01, 0x02, 0x00, 0x00, 0x07, 0x00, 42, 0x00, 0x00, 0x00, 0x00, 0x00])
+)
+
+
+def test_monitor_resolves_the_datapoint_this_model_publishes():
+    coord = _coord("DL-millcore")
+
+    coord._update_monitor(_monitor_props(d302_monitor=SOUL_MONITOR_BLOB))
+
+    assert coord.monitor_property == "d302_monitor"
+    assert coord.monitor["status_name"] == "standby"
+    assert coord.monitor["progress"] == 100
+
+
+def test_a_present_but_empty_candidate_does_not_win():
+    """Exposing a datapoint proves nothing - the Soul carries an always-null one."""
+    coord = _coord("DL-millcore")
+
+    coord._update_monitor(
+        {
+            "d302_monitor_machine": {"value": None},
+            "d302_monitor": {"value": SOUL_MONITOR_BLOB},
+        }
+    )
+
+    assert coord.monitor_property == "d302_monitor"
+    assert coord.monitor["status_name"] == "standby"
+
+
+def test_candidate_priority_is_respected_when_both_carry_values():
+    coord = _coord("DL-striker-cb")
+
+    coord._update_monitor(
+        _monitor_props(
+            d302_monitor_machine=SOUL_MONITOR_BLOB, d302_monitor=SOUL_MONITOR_BLOB
+        )
+    )
+
+    assert coord.monitor_property == "d302_monitor_machine"
+
+
+def test_resolution_is_retried_until_a_value_shows_up():
+    coord = _coord("DL-millcore")
+
+    coord._update_monitor(_monitor_props(d302_monitor="   "))
+    assert coord.monitor_property is None
+    assert coord.monitor == {}
+
+    coord._update_monitor(_monitor_props(d302_monitor=SOUL_MONITOR_BLOB))
+    assert coord.monitor_property == "d302_monitor"
+
+
+def test_the_resolved_name_is_remembered_when_a_poll_brings_nothing():
+    coord = _coord("DL-millcore")
+    coord._update_monitor(_monitor_props(d302_monitor=SOUL_MONITOR_BLOB))
+
+    coord._update_monitor(_monitor_props(d302_monitor=""))
+
+    assert coord.monitor_property == "d302_monitor"
+    assert coord.monitor == {}
+
+
+def test_a_candidate_that_carries_junk_never_wins_over_one_that_decodes():
+    """Carrying bytes proves no more than being listed does.
+
+    A stale or truncated blob on the priority candidate would otherwise lock the
+    poll onto a datapoint that can never yield a status - Machine Status stuck
+    on unknown, which is the very symptom of issue #14.
+    """
+    coord = _coord("DL-millcore")
+
+    coord._update_monitor(
+        _monitor_props(
+            d302_monitor_machine="bm90IGEgbW9uaXRvciBibG9i",  # decodes, isn't MonitorV2
+            d302_monitor=SOUL_MONITOR_BLOB,
+        )
+    )
+
+    assert coord.monitor_property == "d302_monitor"
+    assert coord.monitor["status_name"] == "standby"
+
+
+def test_the_datapoint_moving_after_a_firmware_update_is_followed():
+    coord = _coord("DL-striker-cb")
+    coord._update_monitor(_monitor_props(d302_monitor_machine=ELETTA_MONITOR_BLOB))
+    assert coord.monitor_property == "d302_monitor_machine"
+
+    coord._update_monitor(
+        _monitor_props(d302_monitor_machine=None, d302_monitor=SOUL_MONITOR_BLOB)
+    )
+
+    assert coord.monitor_property == "d302_monitor"
+    assert coord.monitor["status_name"] == "standby"
+
+
+def test_an_eletta_blob_on_its_own_datapoint_decodes_as_before():
+    """Non-regression for the family that already had a working Machine Status."""
+    coord = _coord("DL-striker-cb")
+
+    coord._update_monitor(_monitor_props(d302_monitor_machine=ELETTA_MONITOR_BLOB))
+
+    assert coord.monitor_property == "d302_monitor_machine"
+    assert coord.monitor["status_name"] == "ready"
+    assert coord.monitor["progress"] == 42
+    assert coord.monitor["switches"] == 0x0201
+
+
+def test_no_monitor_datapoint_at_all_is_harmless():
+    coord = _coord("DL-millcore")
+
+    coord._update_monitor({"software_version": {"value": "Millcore_demo 2.0.0"}})
+
+    assert coord.monitor_property is None
+    assert coord.monitor == {}
+
+
+def test_a_corrupt_blob_never_breaks_the_poll():
+    coord = _coord("DL-millcore")
+
+    coord._update_monitor(_monitor_props(d302_monitor="not base64 at all !!"))
+
+    assert "error" in coord.monitor
+
+
+# --- the cloud's own view of the machine (Last Connected) -------------------
+
+
+class _FakeResponse:
+    def __init__(self, payload) -> None:
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+class _FakeSession:
+    """aiohttp.ClientSession.get(), enough for async_get_devices."""
+
+    def __init__(self, payload) -> None:
+        self._payload = payload
+
+    def get(self, url, headers=None):
+        return _FakeResponse(self._payload)
+
+
+def _authenticated_client(payload):
+    client = ac.DelonghiAylaClient(_FakeSession(payload), "user@example.com", "secret")
+    client._access_token = "token"
+    client._expires_at = time.time() + 3600
+    return client
+
+
+def test_device_carries_the_cloud_connected_at():
+    """AylaDevice must transport connected_at: it is the only honest last-seen.
+
+    The device_connected datapoint the sensor used to read was two months stale
+    on the reference machine while the cloud knew the real answer.
+    """
+    client = _authenticated_client(
+        [
+            {
+                "device": {
+                    "dsn": "AC000W019023280",
+                    "product_name": "AC000W019023280",
+                    "oem_model": "DL-millcore",
+                    "model": "AY008ESP1",
+                    "sw_version": "ADA 1.5.3",
+                    "lan_ip": "192.168.130.63",
+                    "connection_status": "Offline",
+                    "connected_at": "2026-08-12T04:01:46Z",
+                }
+            }
+        ]
+    )
+
+    devices = asyncio.run(client.async_get_devices())
+
+    assert devices[0].connected_at == "2026-08-12T04:01:46Z"
+    assert devices[0].connection_status == "Offline"
+
+
+def test_a_device_record_without_connected_at_yields_empty_not_junk():
+    client = _authenticated_client(
+        [{"device": {"dsn": "X", "connection_status": "Online"}}]
+    )
+
+    assert asyncio.run(client.async_get_devices())[0].connected_at == ""
+
+
+def test_last_connected_is_no_longer_wired_to_a_datapoint():
+    """Guard against the row coming back: it is what made the sensor lie."""
+    keys = {key for _candidates, key, _friendly, _icon in const.INFO_SENSORS}
+    assert "last_connected" not in keys
+    named = [name for candidates, *_rest in const.INFO_SENSORS for name in candidates]
+    assert "device_connected" not in named
+    assert "app_device_connected" not in named
+
+
+# --- fan-out across the machines of one config entry ------------------------
+#
+# A service call reaches every machine of the entry. The failure that started
+# this story was silent, but the ones that come back from Ayla are not: a 5xx or
+# an expired token raises CloudError/AuthError, plain Exception subclasses. One
+# machine failing - for any reason - must not cost the others their command.
+
+
+def _failing_coord(exc: Exception):
+    coord = _coord("DL-millcore")
+
+    async def _boom(_self=None) -> None:
+        raise exc
+
+    coord.async_send_wake = _boom  # type: ignore[method-assign]
+    return coord
+
+
+def test_every_machine_is_attempted_before_the_error_surfaces():
+    ok_a, ok_b = _coord("DL-millcore", client=_RecordingClient()), _coord(
+        "DL-millcore", client=_RecordingClient()
+    )
+    boom = _failing_coord(ac.CloudError("Ayla 502"))
+
+    with pytest.raises(ac.CloudError):
+        asyncio.run(
+            coordinator.async_send_to_all(
+                [boom, ok_a, ok_b], lambda coord: coord.async_send_wake()
+            )
+        )
+
+    assert len(ok_a.client.writes) == 1
+    assert len(ok_b.client.writes) == 1
+
+
+def test_a_cloud_error_is_not_swallowed():
+    """The first error must reach the caller, whatever its class."""
+    boom = _failing_coord(ac.AuthError("token expired"))
+
+    with pytest.raises(ac.AuthError):
+        asyncio.run(
+            coordinator.async_send_to_all([boom], lambda coord: coord.async_send_wake())
+        )
+
+
+def test_the_offline_refusal_still_surfaces_through_the_fan_out():
+    offline = _coord("DL-millcore", connection_status="Offline", client=_RecordingClient())
+    online = _coord("DL-millcore", client=_RecordingClient())
+
+    with pytest.raises(_StubHomeAssistantError) as err:
+        asyncio.run(
+            coordinator.async_send_to_all(
+                [offline, online], lambda coord: coord.async_send_wake()
+            )
+        )
+
+    assert err.value.translation_key == "machine_offline"
+    assert len(online.client.writes) == 1
+    assert offline.client.writes == []
+
+
+def test_nothing_is_raised_when_every_machine_takes_it():
+    coords = [_coord("DL-millcore", client=_RecordingClient()) for _ in range(3)]
+
+    asyncio.run(
+        coordinator.async_send_to_all(coords, lambda coord: coord.async_send_wake())
+    )
+
+    assert [len(coord.client.writes) for coord in coords] == [1, 1, 1]
+
+
+def test_the_last_connected_sensor_is_registered_on_every_machine():
+    """The const guard above only proves the datapoint row is gone.
+
+    This pins the other half - that a sensor reading the cloud record replaced
+    it - without needing a Home Assistant install to build the entity.
+    """
+    source = (PKG_DIR / "sensor.py").read_text(encoding="utf-8")
+
+    assert "entities.append(DelonghiLastConnectedSensor(coord))" in source
+    assert 'super().__init__(coord, "last_connected", "mdi:clock-outline")' in source
+    assert "self.coordinator.device.connected_at" in source

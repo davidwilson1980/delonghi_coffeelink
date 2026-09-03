@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -10,29 +12,59 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EntityCategory, UnitOfVolume
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
 from .ayla_client import normalize_signed_app_id
-from .counters import counter_breakdown, parse_counter_value
+from .counters import counter_breakdown, parse_counter_value, parse_water_volume_liters
 from .const import (
     APP_ID_PROPERTY,
+    CONNECTION_STATUS_OPTIONS,
+    COUNTER_MEASUREMENTS,
     COUNTER_SENSORS,
     DOMAIN,
     INFO_SENSORS,
     INTEGRATION_CLOUD_APP_ID,
     MANUFACTURER,
     MONITOR_PROPERTY,
+    MACHINE_STATUS_OPTIONS,
+    MEASUREMENT_WATER_LITERS,
+    normalize_connection_status,
 )
 from .coordinator import DelonghiCoordinator
 
 _HA_CLOUD_SESSION_APP_ID = normalize_signed_app_id(INTEGRATION_CLOUD_APP_ID)
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _Measurement:
+    """How a counter that carries a physical quantity is published.
+
+    One entry per token of ``COUNTER_MEASUREMENTS``; the counter entity itself
+    knows nothing about which key is a volume, so adding a measured counter is a
+    const.py change only.
+    """
+
+    parse: Callable[[Any], int | float | None]
+    device_class: SensorDeviceClass
+    unit: str
+    precision: int
+
+
+_MEASUREMENTS: dict[str, _Measurement] = {
+    MEASUREMENT_WATER_LITERS: _Measurement(
+        parse=parse_water_volume_liters,
+        device_class=SensorDeviceClass.WATER,
+        unit=UnitOfVolume.LITERS,
+        precision=3,
+    ),
+}
 
 
 def _resolve_property(data: dict[str, Any] | None, candidates: list[str]) -> str | None:
@@ -77,6 +109,7 @@ async def async_setup_entry(
                 continue
             entities.append(DelonghiInfoSensor(coord, prop_name, key, icon))
         entities.append(DelonghiConnectionSensor(coord))
+        entities.append(DelonghiLastConnectedSensor(coord))
         entities.append(DelonghiMachineStatusSensor(coord))
         entities.append(DelonghiLastCommandSensor(coord))
         if coord.profile.uses_cloud_session and APP_ID_PROPERTY in (coord.data or {}):
@@ -107,7 +140,13 @@ class _Base(CoordinatorEntity[DelonghiCoordinator], SensorEntity):
 
 
 class DelonghiCounterSensor(_Base):
-    """Integer counter sensor with TOTAL_INCREASING state class."""
+    """Lifetime counter, TOTAL_INCREASING.
+
+    Publishes a plain count, or the scaled physical quantity declared for this
+    key in ``COUNTER_MEASUREMENTS``. TOTAL_INCREASING is kept for measured
+    counters too: they are lifetime meters, and a filter change resetting d555
+    is exactly what that state class is meant to absorb.
+    """
 
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
 
@@ -121,9 +160,17 @@ class DelonghiCounterSensor(_Base):
         super().__init__(coord, key, icon)
         self._prop_name = prop_name
         self._logged_unparseable = False
+        # A plain count unless const.py declares this counter as a measurement.
+        self._parse = parse_counter_value
+        measurement = _MEASUREMENTS.get(COUNTER_MEASUREMENTS.get(key, ""))
+        if measurement is not None:
+            self._parse = measurement.parse
+            self._attr_device_class = measurement.device_class
+            self._attr_native_unit_of_measurement = measurement.unit
+            self._attr_suggested_display_precision = measurement.precision
 
     @property
-    def native_value(self) -> int | None:
+    def native_value(self) -> int | float | None:
         prop = (self.coordinator.data or {}).get(self._prop_name)
         if not prop:
             return None
@@ -134,7 +181,7 @@ class DelonghiCounterSensor(_Base):
         # some as a JSON object of per-recipe sub-counts. parse_counter_value
         # handles both; an unparseable scalar yields None and is logged once so
         # the format can be reported and the parser extended.
-        result = parse_counter_value(val)
+        result = self._parse(val)
         if result is None and not self._logged_unparseable:
             self._logged_unparseable = True
             _LOGGER.warning(
@@ -172,18 +219,11 @@ class DelonghiInfoSensor(_Base):
     ) -> None:
         super().__init__(coord, key, icon)
         self._prop_name = prop_name
-        if key == "last_connected":
-            self._attr_device_class = SensorDeviceClass.TIMESTAMP
 
     @property
     def native_value(self) -> Any:
         prop = (self.coordinator.data or {}).get(self._prop_name)
         if not prop:
-            return None
-        if self._prop_name in ("device_connected", "app_device_connected"):
-            val = prop.get("data_updated_at")
-            if val:
-                return dt_util.parse_datetime(str(val))
             return None
         return prop.get("value")
 
@@ -193,27 +233,59 @@ class DelonghiConnectionSensor(_Base):
 
     def __init__(self, coord: DelonghiCoordinator) -> None:
         super().__init__(coord, "connection_status", "mdi:cloud")
+        self._attr_device_class = SensorDeviceClass.ENUM
+        self._attr_options = list(CONNECTION_STATUS_OPTIONS)
 
     @property
     def native_value(self) -> str:
-        return self.coordinator.device.connection_status
+        return normalize_connection_status(self.coordinator.device.connection_status)
+
+
+class DelonghiLastConnectedSensor(_Base):
+    """When the machine last connected to the De'Longhi (Ayla) cloud.
+
+    Read from the device record's ``connected_at``, NOT from the
+    ``device_connected`` / ``app_device_connected`` datapoint this sensor used
+    to expose. That datapoint is an application-level ping: it goes stale while
+    the machine keeps talking to the cloud (two months out of date on the
+    reference Soul), and on cloud-session models it is written by this
+    integration itself - so it reported a comfortable timestamp for a machine
+    that had been off the network for ten days. No fallback on purpose: an
+    unknown state is worth more than a plausible wrong date.
+    """
+
+    def __init__(self, coord: DelonghiCoordinator) -> None:
+        super().__init__(coord, "last_connected", "mdi:clock-outline")
+        self._attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    @property
+    def native_value(self) -> Any:
+        parsed = dt_util.parse_datetime(self.coordinator.device.connected_at or "")
+        # A TIMESTAMP sensor rejects a naive datetime with a ValueError on every
+        # state write; the cloud normally sends "...Z" but nothing guarantees it.
+        if parsed is None or parsed.tzinfo is None:
+            return None
+        return parsed
 
 
 class DelonghiMachineStatusSensor(_Base):
-    """Machine operational state decoded from ``d302_monitor_machine``
-    (standby, ready, rinsing, ...). Contributed via PR #5 (@TischenkoArseny,
-    based on the DlghIoT client). ``None``/unknown if the blob doesn't parse
-    on this model - the parse error is surfaced as an attribute.
+    """Machine operational state (standby, ready, rinsing, ...) decoded from the
+    monitor blob the machine publishes. Which datapoint carries it depends on the
+    model, so the coordinator resolves it per machine (issue #14). Contributed via
+    PR #5 (@TischenkoArseny, based on the DlghIoT client). ``None``/unknown if the
+    blob doesn't parse on this model - the parse error is surfaced as an attribute.
     """
 
     def __init__(self, coord: DelonghiCoordinator) -> None:
         super().__init__(coord, "machine_status", "mdi:coffee-maker")
+        self._attr_device_class = SensorDeviceClass.ENUM
+        self._attr_options = list(MACHINE_STATUS_OPTIONS)
 
     @property
     def native_value(self) -> str | None:
         monitor = self.coordinator.monitor or {}
         if "error" in monitor:
-            return None
+            return "unknown"
         return monitor.get("status_name")
 
     @property
@@ -250,12 +322,20 @@ def _parse_cloud_session_app_id(raw: Any) -> int | None:
         return None
 
 
-def _cloud_session_holder(app_id: int | None) -> str:
+def _cloud_session_holder(app_id: int | None, own_app_id: int | None = None) -> str:
+    """Who holds the machine's cloud session slot.
+
+    ``own_app_id`` is the id THIS coordinator registers for the machine. On ECAM
+    models that is the machine's own device signature (issue #15), which the
+    official app uses too - so "ha" there means "a session with this machine's
+    id is open", not "opened by Home Assistant". Falls back to the generic
+    constant when the coordinator id is unavailable.
+    """
     if app_id is None:
         return "unknown"
     if app_id == 0:
         return "free"
-    if app_id == _HA_CLOUD_SESSION_APP_ID:
+    if app_id == (_HA_CLOUD_SESSION_APP_ID if own_app_id is None else own_app_id):
         return "ha"
     return "foreign"
 
@@ -284,7 +364,16 @@ class DelonghiCloudSessionAppIdSensor(_Base):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         app_id = self.native_value
-        attrs: dict[str, Any] = {"holder": _cloud_session_holder(app_id)}
+        attrs: dict[str, Any] = {
+            "holder": _cloud_session_holder(
+                app_id, self.coordinator.own_cloud_app_id
+            ),
+            "session_id_source": (
+                "device_signature"
+                if self.coordinator.uses_device_cloud_app_id
+                else "default_constant"
+            ),
+        }
         if app_id is not None:
             attrs["app_id_hex"] = f"{app_id & 0xFFFFFFFF:08x}"
         return attrs

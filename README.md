@@ -23,8 +23,22 @@ Any DeLonghi coffee machine exposed by the Coffee Link mobile app through Ayla N
 - 21 beverage buttons (Espresso, Cappuccino, Latte Macchiato, Hot Water, Tea, etc.)
 - **Wake** and **Standby** buttons (power the machine on / off remotely)
 - Counters sensors (total beverages, per-drink counters, descale status)
+- **Machine Status** (standby, ready, rinsing, dispensing...) and **Connection
+  Status** sensors, plus **Last Connected** - when the machine established its
+  current cloud connection
 - Generic Stop button
 - Services for raw binary command injection (advanced use)
+
+### When the machine is unreachable
+
+The cloud accepts a command for a machine that is offline and answers `200 OK`;
+the machine simply never receives it. So when the cloud reports your machine as
+offline, commands are **refused with a clear error** instead of being written
+into the void - check that the machine is powered at the mains and joined to
+Wi-Fi. *Connection Status* tells you how the cloud sees it right now, and *Last
+Connected* when it last established that connection. A machine merely in standby
+stays online and can still be woken, and `send_raw_command` is never blocked so
+you can always poke a machine by hand.
 
 ## Eletta Explore (and other non-Soul models)
 
@@ -49,6 +63,15 @@ learned (e.g. the wake frame) - so once the Wake teach step above is done, the
 **Standby** button works too.
 
 > If you change a drink's settings in the app (e.g. quantity), start it once more from the app so Home Assistant re-learns the new bytes.
+
+> **Why the teach step also unlocks the cloud session.** ECAM machines only obey
+> commands sent inside a cloud session registered with *their own* 4-byte device
+> signature - the one they append to every frame. That signature is read from the
+> first frame you teach, so before any teach step the machine may accept a command
+> (HTTP 200, valid CRC, `machine_status: ready`) and simply do nothing. The
+> `Cloud Session app_id` diagnostic sensor shows which id is in use through its
+> `session_id_source` attribute (`device_signature` once taught, `default_constant`
+> before). See [issue #15](https://github.com/actabi/delonghi_coffeelink/issues/15).
 
 A read-only **Dump Recipe Datapoints** diagnostic button is also provided; it logs the recipe definitions the machine stores (it sends nothing to the machine). See [issue #1](https://github.com/actabi/delonghi_coffeelink/issues/1) for the reverse-engineering details.
 
