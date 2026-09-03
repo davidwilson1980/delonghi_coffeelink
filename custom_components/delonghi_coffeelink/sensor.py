@@ -30,7 +30,6 @@ from .const import (
     INFO_SENSORS,
     INTEGRATION_CLOUD_APP_ID,
     MANUFACTURER,
-    MONITOR_PROPERTY,
     MACHINE_STATUS_OPTIONS,
     MEASUREMENT_WATER_LITERS,
     normalize_connection_status,
@@ -296,11 +295,16 @@ class DelonghiMachineStatusSensor(_Base):
             if key in monitor:
                 attrs[key] = monitor[key]
 
-        prop = (self.coordinator.data or {}).get(MONITOR_PROPERTY)
-        if isinstance(prop, dict):
-            updated_at = prop.get("data_updated_at")
-            if updated_at:
-                attrs["source_updated_at"] = updated_at
+    monitor_property = self.coordinator.monitor_property
+    prop = (
+        (self.coordinator.data or {}).get(monitor_property)
+        if monitor_property
+        else None
+    )
+    if isinstance(prop, dict):
+        updated_at = prop.get("data_updated_at")
+        if updated_at:
+            attrs["source_updated_at"] = updated_at
         
         # Surface the raw switches/alarms bitfields as hex for troubleshooting,
         # but only on ECAM models: the monitor parser may fill these keys for any
