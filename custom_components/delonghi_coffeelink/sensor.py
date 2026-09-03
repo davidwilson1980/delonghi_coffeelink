@@ -291,32 +291,33 @@ class DelonghiMachineStatusSensor(_Base):
     def extra_state_attributes(self) -> dict[str, Any]:
         monitor = self.coordinator.monitor or {}
         attrs: dict[str, Any] = {}
+
         for key in ("status", "progress", "action", "accessory", "error"):
             if key in monitor:
                 attrs[key] = monitor[key]
 
-    monitor_property = self.coordinator.monitor_property
-    prop = (
-        (self.coordinator.data or {}).get(monitor_property)
-        if monitor_property
-        else None
-    )
-    if isinstance(prop, dict):
-        updated_at = prop.get("data_updated_at")
-        if updated_at:
-            attrs["source_updated_at"] = updated_at
-        
-        # Surface the raw switches/alarms bitfields as hex for troubleshooting,
-        # but only on ECAM models: the monitor parser may fill these keys for any
-        # model, so this uses_cloud_session gate is what keeps them off the Soul.
+        # Preserve our custom source timestamp using the monitor property
+        # dynamically selected by the coordinator.
+        monitor_property = self.coordinator.monitor_property
+        prop = (
+            (self.coordinator.data or {}).get(monitor_property)
+            if monitor_property
+            else None
+        )
+        if isinstance(prop, dict):
+            updated_at = prop.get("data_updated_at")
+            if updated_at:
+                attrs["source_updated_at"] = updated_at
+
+        # Surface raw switches/alarms for troubleshooting on ECAM models.
         if self.coordinator.profile.uses_cloud_session:
             if "switches" in monitor:
                 attrs["switches"] = f"0x{monitor['switches']:04X}"
             if "alarms" in monitor:
                 attrs["alarms"] = f"0x{monitor['alarms']:08X}"
+
         return attrs
-
-
+        
 def _parse_cloud_session_app_id(raw: Any) -> int | None:
     if raw is None:
         return None
